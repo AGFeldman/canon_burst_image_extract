@@ -13,6 +13,8 @@ each track, and constructs individual single-image CR3 files.
 import struct
 import sys
 import os
+import io
+from PIL import Image
 
 
 # --- Low-level helpers ---
@@ -393,9 +395,12 @@ class CR3BurstFile:
             value_offset = struct.unpack(fmt32, cmt3[entry_off+8:entry_off+12])[0]
 
             if tag == 0x403F and count == 3 and typ == 4:
-                # Out-of-line LONG array, change index 2 to 1
-                abs_off = tiff_start + value_offset + 2 * 4
-                cmt3[abs_off:abs_off+4] = struct.pack(fmt32, 1)
+                # Out-of-line LONG array
+                base = tiff_start + value_offset
+                # Change index 1 to 0 (burst stores frame-related value, single = 0)
+                cmt3[base + 1*4:base + 1*4 + 4] = struct.pack(fmt32, 0)
+                # Change index 2 from num_images to 1
+                cmt3[base + 2*4:base + 2*4 + 4] = struct.pack(fmt32, 1)
             elif tag == 0x4040 and count == 10 and typ == 4:
                 # Out-of-line LONG array
                 base = tiff_start + value_offset
@@ -598,6 +603,89 @@ class CR3BurstFile:
         # Build trak
         return make_box('trak', tkhd + mdia)
 
+    def _reencode_thmb(self, thmb_data):
+        """Re-encode the THMB box JPEG at DPP quality and rebuild the box.
+
+        THMB layout: size(4) + 'THMB'(4) + version(4) + width(2) + height(2)
+                     + jpeg_size(4) + unk(4) + jpeg_data
+        """
+        old_jpeg_size = read_u32_be(thmb_data, 16)
+        old_jpeg = thmb_data[24:24 + old_jpeg_size]
+
+        new_jpeg = self._reencode_jpeg(old_jpeg)
+
+        # Rebuild: keep version/width/height, update jpeg_size, keep unk field
+        content = (
+            thmb_data[8:16] +                # version(4) + width(2) + height(2)
+            pack_u32_be(len(new_jpeg)) +      # jpeg_size
+            thmb_data[20:24] +                # unk field (4 bytes)
+            new_jpeg
+        )
+        return make_box('THMB', content)
+
+    @staticmethod
+    def _reencode_jpeg(jpeg_data, quality=70):
+        """Re-encode JPEG data at a target quality level.
+
+        DPP uses standard IJG quantization tables at quality 70 with a
+        specific JPEG structure: no JFIF/APP0, combined DQT and DHT segments.
+        We re-encode with Pillow then post-process to match.
+        """
+        img = Image.open(io.BytesIO(jpeg_data))
+        buf = io.BytesIO()
+        img.save(buf, 'JPEG', quality=quality, subsampling='4:2:2')
+        raw = buf.getvalue()
+
+        # Post-process to match DPP's JPEG structure:
+        # - Strip APP0 (JFIF) marker
+        # - Combine multiple DQT segments into one
+        # - Combine multiple DHT segments into one
+        markers = []  # (marker_byte, payload_bytes) -- excludes SOI/EOI/SOS
+        scan_data = b''
+        pos = 2  # skip SOI (FFD8)
+        while pos < len(raw) - 1:
+            if raw[pos] != 0xFF:
+                break
+            marker = raw[pos + 1]
+            if marker == 0xDA:  # SOS — rest is scan data
+                seg_len = struct.unpack('>H', raw[pos+2:pos+4])[0]
+                scan_data = raw[pos:]
+                break
+            if marker in (0x00, 0xFF):
+                pos += 1
+                continue
+            seg_len = struct.unpack('>H', raw[pos+2:pos+4])[0]
+            payload = raw[pos+4:pos+2+seg_len]
+            if marker != 0xE0:  # skip APP0 (JFIF)
+                markers.append((marker, payload))
+            pos += 2 + seg_len
+
+        # Combine DQT segments
+        dqt_payloads = b''
+        dht_payloads = b''
+        result = b'\xff\xd8'
+        for marker, payload in markers:
+            if marker == 0xDB:  # DQT
+                dqt_payloads += payload
+            elif marker == 0xC4:  # DHT
+                dht_payloads += payload
+            else:
+                # Flush DQT before SOF
+                if marker in (0xC0, 0xC1, 0xC2) and dqt_payloads:
+                    seg_len = 2 + len(dqt_payloads)
+                    result += b'\xff\xdb' + struct.pack('>H', seg_len) + dqt_payloads
+                    dqt_payloads = b''
+                result += b'\xff' + bytes([marker])
+                result += struct.pack('>H', 2 + len(payload)) + payload
+
+        # Flush DHT before SOS
+        if dht_payloads:
+            seg_len = 2 + len(dht_payloads)
+            result += b'\xff\xc4' + struct.pack('>H', seg_len) + dht_payloads
+
+        result += scan_data
+        return result
+
     def _build_canon_uuid(self, image_index):
         """Build the Canon-specific UUID box for a single image."""
         content = b''
@@ -615,8 +703,7 @@ class CR3BurstFile:
             elif sub['type'] == b'CMT3':
                 content += self._patch_cmt3_for_image(sub['data'], image_index)
             elif sub['type'] == b'THMB':
-                # Use burst's THMB (not per-image, but functional)
-                content += sub['data']
+                content += self._reencode_thmb(sub['data'])
             else:
                 content += sub['data']
 
@@ -686,29 +773,24 @@ class CR3BurstFile:
 
         ctbo_entries: dict mapping entry_index to (offset, size)
         """
-        # Find CTBO box within the Canon UUID sub-box
-        # CTBO is one of the sub-boxes in the Canon UUID
         moov = bytearray(moov_data)
 
-        # Search for CTBO within the moov
-        pos = 0
-        while pos < len(moov) - 8:
-            size = read_u32_be(bytes(moov), pos)
-            box_type = moov[pos+4:pos+8]
-            if size < 8:
-                break
-            if box_type == b'CTBO':
-                # Found it. Parse and patch.
-                count = read_u32_be(bytes(moov), pos + 8)
-                for i in range(count):
-                    entry_offset = pos + 12 + i * 20
-                    idx = read_u32_be(bytes(moov), entry_offset)
-                    if idx in ctbo_entries:
-                        new_offset, new_size = ctbo_entries[idx]
-                        moov[entry_offset+4:entry_offset+12] = pack_u64_be(new_offset)
-                        moov[entry_offset+12:entry_offset+20] = pack_u64_be(new_size)
-                return bytes(moov)
-            pos += 1  # byte-by-byte search since CTBO is nested
+        # Find CTBO box type signature in moov
+        idx = moov.find(b'CTBO')
+        if idx < 4:
+            return bytes(moov)
+        pos = idx - 4  # box starts 4 bytes before the type field
+
+        # CTBO layout: size(4) + 'CTBO'(4) + count(4) + entries(count * 20)
+        # Each entry: index(4) + offset(8) + size(8)
+        count = read_u32_be(bytes(moov), pos + 8)
+        for i in range(count):
+            entry_offset = pos + 12 + i * 20
+            entry_idx = read_u32_be(bytes(moov), entry_offset)
+            if entry_idx in ctbo_entries:
+                new_offset, new_size = ctbo_entries[entry_idx]
+                moov[entry_offset+4:entry_offset+12] = pack_u64_be(new_offset)
+                moov[entry_offset+12:entry_offset+20] = pack_u64_be(new_size)
 
         return bytes(moov)
 
@@ -731,8 +813,9 @@ class CR3BurstFile:
         ftyp = self.ftyp
         xmp_uuid = self.xmp_box
 
-        # Build PRVW from this image's Track 1 JPEG
-        prvw_uuid = self._build_prvw_uuid(track_data[0])
+        # Build PRVW from this image's Track 1 JPEG, re-encoded at DPP quality
+        prvw_jpeg = self._reencode_jpeg(track_data[0])
+        prvw_uuid = self._build_prvw_uuid(prvw_jpeg)
 
         cmta_uuid = self.cmta_box
         free_box = self.free_box
