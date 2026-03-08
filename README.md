@@ -1,6 +1,8 @@
 Extract individual CR3 images from a Canon CR3 burst/roll file produced by Canon R7. 
 
+Usage:
 ```
+pip3 install -r requirements.txt
 python3 extract_burst.py <path_to_your_burst_file.CR3>
 ```
 
