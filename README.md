@@ -10,7 +10,7 @@ The extracted files are not identical to those produced by DPP, however, they ar
 
 Tested with:
 * Input cRAW (compressed RAW) burst files from Canon R7
-* Viewing/editing programs DxO PhotoLab 8.13.0, Digital Photo Professional 4.20.20.0, FastRawViewr 2.0.9, macOS 26.3
+* Viewing/editing programs DxO PhotoLab 8.13.0, Digital Photo Professional 4.20.20.0, FastRawViewer 2.0.9, macOS 26.3
 
 Not tested with:
 * Uncompressed RAW files
