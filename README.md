@@ -6,7 +6,7 @@ pip3 install -r requirements.txt
 python3 extract_burst.py <path_to_your_burst_file.CR3>
 ```
 
-The extracted files are not identical to those produced by DPP, however, they are likely to be functionally identical unless you want to view AF points or sensor calibration data ([comparison](https://github.com/AGFeldman/canon_burst_image_extract/blob/main/comparison.md)). Want to test that a sample extracted image works with your editing workflow? Here is a [sample image](http://aaron.na31.org/samples/202309070734-R3D_0806burst_1.CR3) extracted by this script.
+The extracted files are not identical to those produced by DPP, however, they are likely to be functionally identical unless you want to view AF points or sensor calibration data ([comparison](https://github.com/AGFeldman/canon_burst_image_extract/blob/main/comparison.md)). Want to test that a sample extracted image works with your editing workflow? Here is a [sample image](https://aaron.na31.org/samples/202309070734-R3D_0806burst_1.CR3) extracted by this script.
 
 Tested with:
 * Input cRAW (compressed RAW) burst files from Canon R7
